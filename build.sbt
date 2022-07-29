@@ -198,13 +198,25 @@ ThisBuild / pomIncludeRepository := { _ =>
   false
 }
 ThisBuild / publishTo := {
-  val nexus = "https://oss.sonatype.org/"
+/*  val nexus = "https://oss.sonatype.org/"
   if (isSnapshot.value) {
     Some("snapshots" at nexus + "content/repositories/snapshots")
   } else {
     Some("releases" at nexus + "service/local/staging/deploy/maven2")
   }
+*/
+  // publish to github packages settings
+  Some("GitHub 6point6 Apache Maven Packages" at "https://maven.pkg.github.com/6point6/hyperspace"),
 }
+
+ThisBuild / credentials += Credentials(
+    "GitHub Package Registry",
+    "maven.pkg.github.com",
+    "6point6",
+    System.getenv("GITHUB_TOKEN")
+)
+
+
 
 ThisBuild / publishMavenStyle := true
 
