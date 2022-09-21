@@ -139,6 +139,9 @@ object IndexConstants {
   // "/temp/1/*, /temp/2/*"
   val GLOBBING_PATTERN_KEY = "spark.hyperspace.source.globbingPattern"
 
+  // Indicate whether the index has been built over a nested field.
+  private[hyperspace] val USES_NESTED_FIELDS_PROPERTY = "hasNestedFields"
+
   /**
    * Target size for an index data file for data skipping indexes.
    *

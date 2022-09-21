@@ -531,6 +531,11 @@ case class IndexLogEntry(
     directory.subDirs.map(d => s"$prefix${d.name}")
   }
 
+  def usesNestedFields: Boolean = {
+    derivedDataset.properties.properties.getOrElse(
+      IndexConstants.USES_NESTED_FIELDS_PROPERTY, "false").toBoolean
+  }
+
   /**
    * A mutable map for holding auxiliary information of this index log entry while applying rules.
    */

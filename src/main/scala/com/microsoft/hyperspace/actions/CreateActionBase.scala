@@ -17,43 +17,56 @@
 package com.microsoft.hyperspace.actions
 
 import org.apache.hadoop.fs.Path
-import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.{DataFrame, SaveMode, SparkSession}
+import org.apache.spark.sql.catalyst.plans.logical.LeafNode
+import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
+import org.apache.spark.sql.functions.{col, input_file_name}
+import org.apache.spark.sql.types.StructType
 
 import com.microsoft.hyperspace.{Hyperspace, HyperspaceException}
 import com.microsoft.hyperspace.index._
+import com.microsoft.hyperspace.index.DataFrameWriterExtensions.Bucketizer
 import com.microsoft.hyperspace.index.sources.FileBasedRelation
-import com.microsoft.hyperspace.util.{PathUtils, ResolverUtils}
+import com.microsoft.hyperspace.util.{HyperspaceConf, PathUtils, ResolverUtils, SchemaUtils}
 
 /**
  * CreateActionBase provides functionality to write dataframe as covering index.
  */
-private[actions] abstract class CreateActionBase(dataManager: IndexDataManager)
-    extends IndexerContext {
-  override lazy val indexDataPath: Path = {
+private[actions] abstract class CreateActionBase(dataManager: IndexDataManager) {
+  protected lazy val indexDataPath: Path = {
     dataManager
       .getLatestVersionId()
       .map(id => dataManager.getPath(id + 1))
       .getOrElse(dataManager.getPath(0))
   }
 
-  override val fileIdTracker = new FileIdTracker
+  protected val fileIdTracker = new FileIdTracker
+
+  protected def numBucketsForIndex(spark: SparkSession): Int = {
+    HyperspaceConf.numBucketsForIndex(spark)
+  }
+
+  protected def hasLineage(spark: SparkSession): Boolean = {
+    HyperspaceConf.indexLineageEnabled(spark)
+  }
 
   protected def getIndexLogEntry(
       spark: SparkSession,
       df: DataFrame,
-      indexName: String,
-      index: Index,
-      path: Path,
-      versionId: Int): IndexLogEntry = {
-    val hadoopConf = spark.sessionState.newHadoopConf()
-    val absolutePath = PathUtils.makeAbsolute(path, hadoopConf)
+      indexConfig: IndexConfig,
+      path: Path): IndexLogEntry = {
+    val absolutePath = PathUtils.makeAbsolute(path, spark.sessionState.newHadoopConf())
+    val numBuckets = numBucketsForIndex(spark)
 
     val signatureProvider = LogicalPlanSignatureProvider.create()
 
-    val sourcePlan = df.queryExecution.optimizedPlan
-    signatureProvider.signature(sourcePlan) match {
+    // Resolve the passed column names with existing column names from the dataframe.
+    val (indexDataFrame, resolvedIndexedColumns, resolvedIncludedColumns) =
+      prepareIndexDataFrame(spark, df, indexConfig)
+
+    signatureProvider.signature(df.queryExecution.optimizedPlan) match {
       case Some(s) =>
-        val relation = RelationUtils.getRelation(spark, sourcePlan)
+        val relation = getRelation(spark, df)
         val sourcePlanProperties = SparkPlan.Properties(
           Seq(relation.createRelationMetadata(fileIdTracker)),
           null,
@@ -61,20 +74,20 @@ private[actions] abstract class CreateActionBase(dataManager: IndexDataManager)
           LogicalPlanFingerprint(
             LogicalPlanFingerprint.Properties(Seq(Signature(signatureProvider.name, s)))))
 
-        val indexProperties =
-          Hyperspace
-            .getContext(spark)
-            .sourceProviderManager
-            .getRelationMetadata(sourcePlanProperties.relations.head)
-            .enrichIndexProperties(
-              index.properties
-                + (IndexConstants.INDEX_LOG_VERSION -> versionId.toString)
-                ++ hasParquetAsSourceFormatProperty(relation))
+        val coveringIndexProperties =
+          (hasLineageProperty(spark) ++ hasParquetAsSourceFormatProperty(relation) ++
+            usesNestedFieldsProperty(indexConfig)).toMap
 
-        IndexLogEntry.create(
-          indexName,
-          index.withNewProperties(indexProperties),
-          Content.fromDirectory(absolutePath, fileIdTracker, hadoopConf),
+        IndexLogEntry(
+          indexConfig.indexName,
+          CoveringIndex(
+            CoveringIndex.Properties(
+              CoveringIndex.Properties
+                .Columns(resolvedIndexedColumns, resolvedIncludedColumns),
+              IndexLogEntry.schemaString(indexDataFrame.schema),
+              numBuckets,
+              coveringIndexProperties)),
+          Content.fromDirectory(absolutePath, fileIdTracker),
           Source(SparkPlan(sourcePlanProperties)),
           Map())
 
@@ -99,5 +112,127 @@ private[actions] abstract class CreateActionBase(dataManager: IndexDataManager)
     } else {
       None
     }
+  }
+
+  private def hasLineageProperty(spark: SparkSession): Option[(String, String)] = {
+    if (hasLineage(spark)) {
+      Some(IndexConstants.LINEAGE_PROPERTY -> "true")
+    } else {
+      None
+    }
+  }
+
+  private def usesNestedFieldsProperty(indexConfig: IndexConfig): Option[(String, String)] = {
+    if (SchemaUtils.hasNestedFields(indexConfig.indexedColumns ++ indexConfig.includedColumns)) {
+      Some(IndexConstants.USES_NESTED_FIELDS_PROPERTY -> "true")
+    } else {
+      None
+    }
+  }
+
+  protected def write(spark: SparkSession, df: DataFrame, indexConfig: IndexConfig): Unit = {
+    val numBuckets = numBucketsForIndex(spark)
+
+    val (indexDataFrame, resolvedIndexedColumns, _) =
+      prepareIndexDataFrame(spark, df, indexConfig)
+
+    // run job
+    val repartitionedIndexDataFrame =
+      indexDataFrame.repartition(numBuckets, resolvedIndexedColumns.map(c => col(s"$c")): _*)
+
+    // Save the index with the number of buckets specified.
+    repartitionedIndexDataFrame.write
+      .saveWithBuckets(
+        repartitionedIndexDataFrame,
+        indexDataPath.toString,
+        numBuckets,
+        resolvedIndexedColumns,
+        SaveMode.Overwrite)
+  }
+
+  protected def getRelation(spark: SparkSession, df: DataFrame): FileBasedRelation = {
+    val provider = Hyperspace.getContext(spark).sourceProviderManager
+    val relations = df.queryExecution.optimizedPlan.collect {
+      case l: LeafNode if provider.isSupportedRelation(l) =>
+        provider.getRelation(l)
+    }
+    // Currently we only support creating an index on a single relation.
+    assert(relations.length == 1)
+    relations.head
+  }
+
+  private def resolveConfig(
+      df: DataFrame,
+      indexConfig: IndexConfig): (Seq[String], Seq[String]) = {
+    val spark = df.sparkSession
+    val dfColumnNames = SchemaUtils.flatten(df.schema)
+    val indexedColumns = SchemaUtils.unescapeFieldNames(indexConfig.indexedColumns)
+    val includedColumns = SchemaUtils.unescapeFieldNames(indexConfig.includedColumns)
+    val resolvedIndexedColumns = ResolverUtils.resolve(spark, indexedColumns, dfColumnNames)
+    val resolvedIncludedColumns = ResolverUtils.resolve(spark, includedColumns, dfColumnNames)
+
+    (resolvedIndexedColumns, resolvedIncludedColumns) match {
+      case (Some(indexed), Some(included)) => (indexed, included)
+      case _ =>
+        val unresolvedColumns = (indexedColumns ++ includedColumns)
+          .map(c => (c, ResolverUtils.resolve(spark, c, dfColumnNames)))
+          .collect { case c if c._2.isEmpty => c._1 }
+        throw HyperspaceException(
+          s"Columns '${unresolvedColumns.mkString(",")}' could not be resolved " +
+            s"from available source columns '${dfColumnNames.mkString(",")}'")
+    }
+  }
+
+  private def prepareIndexDataFrame(
+      spark: SparkSession,
+      df: DataFrame,
+      indexConfig: IndexConfig): (DataFrame, Seq[String], Seq[String]) = {
+    val (resolvedIndexedColumns, resolvedIncludedColumns) = resolveConfig(df, indexConfig)
+    val columnsFromIndexConfig = resolvedIndexedColumns ++ resolvedIncludedColumns
+
+    val indexDF = if (hasLineage(spark)) {
+      val relation = getRelation(spark, df)
+
+      // Lineage is captured using two sets of columns:
+      // 1. DATA_FILE_ID_COLUMN column contains source data file id for each index record.
+      // 2. If source data is partitioned, all partitioning key(s) are added to index schema
+      //    as columns if they are not already part of the schema.
+      val partitionColumns = relation.partitionSchema.map(_.name)
+      val missingPartitionColumns =
+        partitionColumns.filter(ResolverUtils.resolve(spark, _, columnsFromIndexConfig).isEmpty)
+      val allIndexColumns = columnsFromIndexConfig ++ missingPartitionColumns
+
+      // File id value in DATA_FILE_ID_COLUMN column (lineage column) is stored as a
+      // Long data type value. Each source data file has a unique file id, assigned by
+      // Hyperspace. We populate lineage column by joining these file ids with index records.
+      // The normalized path of source data file for each record is the join key.
+      // We normalize paths by removing extra preceding `/` characters in them,
+      // similar to the way they are stored in Content in an IndexLogEntry instance.
+      // Path normalization example:
+      // - Original raw path (output of input_file_name() udf, before normalization):
+      //    + file:///C:/hyperspace/src/test/part-00003.snappy.parquet
+      // - Normalized path (used in join):
+      //    + file:/C:/hyperspace/src/test/part-00003.snappy.parquet
+      import spark.implicits._
+      val dataPathColumn = "_data_path"
+      val lineagePairs = relation.lineagePairs(fileIdTracker)
+      val lineageDF = lineagePairs.toDF(dataPathColumn, IndexConstants.DATA_FILE_NAME_ID)
+
+      df.withColumn(dataPathColumn, input_file_name())
+        .join(lineageDF.hint("broadcast"), dataPathColumn)
+        .select(
+          allIndexColumns.head,
+          allIndexColumns.tail :+ IndexConstants.DATA_FILE_NAME_ID: _*)
+        .toDF(
+          SchemaUtils.escapeFieldNames(allIndexColumns) :+ IndexConstants.DATA_FILE_NAME_ID: _*)
+    } else {
+      df.select(columnsFromIndexConfig.head, columnsFromIndexConfig.tail: _*)
+        .toDF(SchemaUtils.escapeFieldNames(columnsFromIndexConfig): _*)
+    }
+
+    val escapedIndexedColumns = SchemaUtils.escapeFieldNames(resolvedIndexedColumns)
+    val escapedIncludedColumns = SchemaUtils.escapeFieldNames(resolvedIncludedColumns)
+
+    (indexDF, escapedIndexedColumns, escapedIncludedColumns)
   }
 }

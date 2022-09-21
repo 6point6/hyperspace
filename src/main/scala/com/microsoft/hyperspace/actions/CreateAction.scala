@@ -19,17 +19,18 @@ package com.microsoft.hyperspace.actions
 import scala.util.Try
 
 import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.types.StructType
 
 import com.microsoft.hyperspace.{Hyperspace, HyperspaceException}
 import com.microsoft.hyperspace.actions.Constants.States.{ACTIVE, CREATING, DOESNOTEXIST}
 import com.microsoft.hyperspace.index._
 import com.microsoft.hyperspace.telemetry.{AppInfo, CreateActionEvent, HyperspaceEvent}
-import com.microsoft.hyperspace.util.{HyperspaceConf, ResolverUtils}
+import com.microsoft.hyperspace.util.{HyperspaceConf, ResolverUtils, SchemaUtils}
 
 class CreateAction(
-    override val spark: SparkSession,
+    spark: SparkSession,
     df: DataFrame,
-    indexConfig: IndexConfigTrait,
+    indexConfig: IndexConfig,
     final override protected val logManager: IndexLogManager,
     dataManager: IndexDataManager)
     extends CreateActionBase(dataManager)
@@ -56,21 +57,12 @@ class CreateAction(
           s"Source plan: ${df.queryExecution.sparkPlan}")
     }
 
-    // Schema validity checks
-
-    // Resolve index config columns from available column names present in the dataframe.
-    val resolvedColumns = ResolverUtils
-      .resolve(spark, indexConfig.referencedColumns, df.queryExecution.analyzed)
-    if (resolvedColumns.isEmpty) {
+    // schema validity checks
+    if (!isValidIndexSchema(indexConfig, df.schema)) {
       throw HyperspaceException("Index config is not applicable to dataframe schema.")
     }
 
-    // TODO: Temporarily block creating indexes using nested columns until it's fully supported.
-    if (!(HyperspaceConf.nestedColumnEnabled(spark) || resolvedColumns.get.forall(!_.isNested))) {
-      throw HyperspaceException("Hyperspace does not support nested columns yet.")
-    }
-
-    // Valid state check
+    // valid state check
     logManager.getLatestLog() match {
       case None => // valid
       case Some(entry) if entry.state.equals(DOESNOTEXIST) => // valid
@@ -78,6 +70,19 @@ class CreateAction(
         throw HyperspaceException(
           s"Another Index with name ${indexConfig.indexName} already exists")
     }
+  }
+
+  private def isValidIndexSchema(config: IndexConfig, schema: StructType): Boolean = {
+    // Flatten the schema to support nested fields
+    val fields = SchemaUtils.escapeFieldNames(SchemaUtils.flatten(schema))
+    // Resolve index config columns from available column names present in the schema.
+    ResolverUtils
+      .resolve(
+        spark,
+        SchemaUtils.escapeFieldNames(config.indexedColumns)
+          ++ SchemaUtils.escapeFieldNames(config.includedColumns),
+        fields)
+      .isDefined
   }
 
   // TODO: The following should be protected, but RefreshAction is calling CreateAction.op().
